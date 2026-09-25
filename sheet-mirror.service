@@ -5,12 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
-Group=pi
-WorkingDirectory=/home/pi/discord-sheet-mirror
-EnvironmentFile=/home/pi/discord-sheet-mirror/.env
+User=journ
+WorkingDirectory=/home/journ/PackServerBot
+EnvironmentFile=/home/journ/PackServerBot/.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/pi/discord-sheet-mirror/.venv/bin/python bot.py --config config.yaml
+ExecStart=/home/journ/PackServerBot/.venv/bin/python bot.py --config config.yaml
 Restart=always
 RestartSec=15
 
@@ -19,7 +18,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectKernelTunables=true
-ReadWritePaths=/home/pi/discord-sheet-mirror
+ReadWritePaths=/home/journ/PackServerBot
 
 [Install]
 WantedBy=multi-user.target
