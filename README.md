@@ -77,6 +77,89 @@ Watch the size limit: a long multi-frame sheet can easily clear 10 MB, and
 anything over `max_upload_mb` is skipped with a log line rather than failing the
 channel. If that bites, drop `--scale` to 2 or add `--max-frames`.
 
+## Dashboard
+
+The bot serves a status page on **port 2728** (`dashboard.host` / `dashboard.port`).
+`0.0.0.0` means anything on the LAN can reach it; use `127.0.0.1` to keep it on the
+Pi only.
+
+```
+http://<pi-address>:2728
+```
+
+It shows connection state, channels tracked, sheet rows, when the last sync ran and
+what it changed, when the next one is due, how many renders are failing, how many
+channels are blocked by permissions, and a live console tail. **Sync now** runs a
+normal sync; **Force rebuild** ignores every cache and re-renders all packs (hours
+of work on a Pi, so it asks first).
+
+Endpoints, if you want to drive it from a script:
+
+| Route | Purpose |
+| --- | --- |
+| `GET /` | the page |
+| `GET /api/status` | JSON state plus recent log lines (`?after=<seq>` for only new ones) |
+| `POST /api/sync` | start a sync; body `{"force": true}` to ignore caches |
+| `GET /healthz` | liveness, no auth |
+
+A sync runs in the background, so `POST /api/sync` returns straight away — `202`-style
+`{"started": true}`, or `409` if one is already running. It uses the same code path as
+`/sync` in Discord, so the button and the slash command behave identically.
+
+Anyone who can reach the port can trigger a sync, which downloads and renders every
+pack. Set `dashboard.auth_token` to require a shared secret; the page asks for it once
+and keeps it for the browser session, and `/api/*` then needs an `X-Auth-Token`
+header. The bot logs a warning at startup whenever the token is empty.
+
+To reach it from outside the LAN, put it behind a reverse proxy or a VPN rather than
+forwarding port 2728 — there is no TLS here.
+
+## Scheduling
+
+`runtime.poll_seconds` is **86400** (once a day). The packs change rarely and a full
+pass is expensive, so the daily sweep is a backstop; use the dashboard button or
+`/sync` when you have actually edited the sheet. The minimum accepted value is 60.
+
+## Channel naming
+
+A row's channel name is its slugified sheet name: `Andrecks Vapor (Eveoi Additions)`
+becomes `andrecks-vapor-eveoi-additions`. Two rows in this sheet don't follow that,
+because the channels were shortened by hand when they were made, so they are listed
+explicitly in `discord.channel_overrides`:
+
+```yaml
+channel_overrides:
+  "Control Pit Pack": control
+  "Novis Pit Edit": novis
+```
+
+Plain `Pit` / `Pack` names were kept as-is (`blue-pit`, `log-pack`, `marpacker`) and
+need no entry. Add a line here for any future row whose channel doesn't match its
+sheet name — the row's identity in `state.json` stays the slug, so adding or changing
+an override renames the channel rather than recreating it.
+
+## Permissions
+
+The pack categories deny `send_messages` to `@everyone` and allow it only for the
+`Admin` role, so the bot cannot post in them by default. With
+`discord.fix_permissions: true` the bot grants itself what it needs on each managed
+category, and the pack channels — which are permission-synced to their category —
+inherit it and stay synced. Channels created later inherit it too.
+
+That requires the **Manage Permissions** (`manage_roles`) permission. Server Settings
+→ Roles → `PackServer` → enable Manage Permissions, or re-invite with it included.
+Without it the bot logs one clear error and changes nothing.
+
+Set `fix_permissions: false` if you would rather add the allow yourself: for each of
+the 23 letter/`#` categories, add the bot's role and allow View Channel, Send
+Messages, Read Message History, Manage Messages and Attach Files.
+
+**The bot never purges a channel it cannot post into.** The rebuild deletes before it
+reposts, so without send access a channel would be emptied and left empty. Each
+channel is permission-checked first and skipped with a reason if anything is missing;
+those show up in the sync summary as `blocked_by_permissions`, and on the dashboard as
+a tile and a banner.
+
 ## Rebuild on change
 
 Each channel stores a hash of its info text plus the GIF filenames. When that
@@ -105,11 +188,12 @@ first cleanup pass.
    identifies its own messages by author ID — so leave **Message Content Intent**
    off and `message_content_intent: false`. If you turn the config flag on without
    enabling it in the portal, startup fails with a clear error.
-3. Invite it with **Manage Channels**, **View Channels**, **Send Messages**,
-   **Read Message History**, and **Manage Messages** if you want pinning:
+3. Invite it with **Manage Channels**, **Manage Permissions**, **View Channels**,
+   **Send Messages**, **Read Message History**, **Attach Files**, **Embed Links** and
+   **Manage Messages** (bulk delete is required for the rebuild path):
 
    ```
-   https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&permissions=277025467408&scope=bot%20applications.commands
+   https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&permissions=268561424&scope=bot%20applications.commands
    ```
 4. Right-click your server → Copy Server ID (Developer Mode on) → `discord.guild_id`.
 
@@ -221,7 +305,11 @@ journalctl -u sheet-mirror -f
 - `/sync` — re-read the sheet immediately (requires Manage Channels).
 - `/sync force:true` — same, but ignores every cache and rebuilds all channels
   and GIFs. Expensive; use after changing the GIF script.
-- `/mirror-status` — channels tracked, poll interval, GIF state, failing rows.
+- `/mirror-status` — state, channels tracked, sheet rows, sync interval, render
+  health, when the last sync ran and what it changed, and the dashboard port.
+
+`/sync` and the dashboard's **Sync now** button are the same operation; use whichever
+is closer to hand.
 
 ## Files
 
@@ -232,6 +320,7 @@ journalctl -u sheet-mirror -f
 | `gifs.py` | pack download, renderer invocation, output cache |
 | `sheets.py` | read-only Sheets client and column mapping |
 | `config.py` | config loading, `.env` reading, defaults and validation |
+| `dashboard.py` | the status page, its JSON API, and the in-memory log buffer |
 | `render_cit_inventory.py` | the CIT inventory renderer invoked per pack |
 | `smoke_test.py` | offline check of the renderer/bot wiring; no credentials needed |
 | `gif-cache/` | generated — rendered sheets per download URL. Safe to delete; they re-render. |

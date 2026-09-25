@@ -48,6 +48,13 @@ DEFAULTS: Dict[str, Any] = {
         "category_mode": "letter",      # "letter" (A, B, C...) or "none"
         "other_category": "#",          # category for names not starting with a letter
         "adopt_existing": True,         # take over channels that already have the right name
+        # Sheet name -> channel name, for rows whose channel does not follow
+        # slugification. Matched case-insensitively on the row name or its slug.
+        "channel_overrides": {},
+        # Grant the bot the access it needs on channels/categories it manages.
+        # Needs the Manage Permissions (manage_roles) permission. Preferred on the
+        # category so permission-synced channels inherit it and stay synced.
+        "fix_permissions": True,
         "delete_removed": True,         # delete channels whose row disappeared from the sheet
         "prune_empty_categories": False,
         "protected_channels": [],       # never touched, by channel name
@@ -118,8 +125,15 @@ DEFAULTS: Dict[str, Any] = {
         "max_retries": 3,               # give up on a failing link until it changes
         "post_errors": False,           # post a note in-channel when generation fails
     },
+    "dashboard": {
+        "enabled": True,
+        "host": "0.0.0.0",              # reachable from the LAN; use 127.0.0.1 to keep it local
+        "port": 2728,
+        "auth_token": "",               # set a secret to require it for status and sync
+        "log_lines": 400,               # size of the in-memory console buffer
+    },
     "runtime": {
-        "poll_seconds": 300,
+        "poll_seconds": 86400,          # once a day; /sync or the dashboard for on-demand
         "state_file": "state.json",
         "dry_run": False,
         "log_level": "INFO",
@@ -148,14 +162,20 @@ class Config:
         self.sheets = merged["sheets"]
         self.message = merged["message"]
         self.gif = merged["gif"]
+        self.dashboard = merged["dashboard"]
         self.runtime = merged["runtime"]
-
-        load_env_file(os.path.join(os.path.dirname(os.path.abspath(path)), ".env"))
-        self.token = os.environ.get("DISCORD_TOKEN") or self.discord.get("token")
-        self.guild_id = int(os.environ.get("DISCORD_GUILD_ID") or self.discord["guild_id"] or 0)
 
         self.base_dir = os.path.dirname(os.path.abspath(path))
         base_dir = self.base_dir
+
+        # Look beside the config first, then beside the code. Normally the same
+        # directory; they differ when --config points somewhere else. Values
+        # already in the real environment always win over both.
+        for env_dir in dict.fromkeys((base_dir, os.path.dirname(os.path.abspath(__file__)))):
+            load_env_file(os.path.join(env_dir, ".env"))
+
+        self.token = os.environ.get("DISCORD_TOKEN") or self.discord.get("token")
+        self.guild_id = int(os.environ.get("DISCORD_GUILD_ID") or self.discord["guild_id"] or 0)
         for section, key in (
             ("sheets", "service_account_file"),
             ("runtime", "state_file"),
@@ -232,6 +252,22 @@ class Config:
                 problems.append(
                     f"gif.download_field {self.gif['download_field']!r} is not in sheets.columns."
                 )
+
+        if self.dashboard["enabled"]:
+            try:
+                port = int(self.dashboard["port"])
+            except (TypeError, ValueError):
+                port = -1
+            if not 1 <= port <= 65535:
+                problems.append(f"dashboard.port must be 1-65535, got {self.dashboard['port']!r}.")
+            if not str(self.dashboard["host"]).strip():
+                problems.append("dashboard.host must be set (0.0.0.0 for the LAN, 127.0.0.1 for local only).")
+
+        try:
+            if int(self.runtime["poll_seconds"]) < 60:
+                problems.append("runtime.poll_seconds must be at least 60.")
+        except (TypeError, ValueError):
+            problems.append(f"runtime.poll_seconds must be a number, got {self.runtime['poll_seconds']!r}.")
 
         if problems:
             raise ConfigError(

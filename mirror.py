@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
@@ -91,6 +92,26 @@ class Mirror:
         self.dry_run = bool(cfg.runtime["dry_run"])
         self._lock = asyncio.Lock()
         self._gif_budget = 0
+        self._blocked: List[str] = []
+        self._warned_manage_roles = False
+        # Surfaced by the dashboard and /mirror-status; purely observational.
+        self.status: Dict[str, object] = {
+            "state": "idle",          # idle | running | error
+            "last_reason": None,
+            "last_started": None,     # epoch seconds
+            "last_finished": None,
+            "last_duration": None,    # seconds
+            "last_stats": {},
+            "last_error": None,
+            "rows_seen": None,        # rows in the sheet on the last successful read
+            "blocked": [],            # channels skipped for missing permissions
+            "sync_count": 0,
+        }
+
+    @property
+    def busy(self) -> bool:
+        """True while a sync is in flight, so a second one is not started."""
+        return self._lock.locked()
 
     # ---------- building the desired picture ----------
 
@@ -141,10 +162,19 @@ class Mirror:
     def build_desired(self, rows: List[dict]) -> Dict[str, Desired]:
         desired: Dict[str, Desired] = {}
         used_names: Dict[str, str] = {}
+        overrides = {
+            str(k).strip().lower(): str(v).strip()
+            for k, v in (self.cfg.discord.get("channel_overrides") or {}).items()
+        }
         for row in rows:
             slug = slugify(row["name"])
             key = row.get("_key") or slug
-            channel_name = slug
+            # The key stays the slug so state survives an override change; only
+            # the Discord channel name is overridden.
+            override = overrides.get(row["name"].strip().lower()) or overrides.get(slug)
+            channel_name = slugify(override) if override else slug
+            if override:
+                log.debug("Row %r uses the overridden channel #%s", row["name"], channel_name)
             if channel_name in used_names and used_names[channel_name] != key:
                 suffix = 2
                 while f"{slug}-{suffix}"[:100] in used_names:
@@ -168,6 +198,54 @@ class Mirror:
         return desired
 
     # ---------- Discord helpers ----------
+
+    def _is_managed_category(self, name: Optional[str]) -> bool:
+        """True for the A/B/C.../# categories this bot files channels into."""
+        if not name or self.cfg.discord["category_mode"] == "none":
+            return False
+        if name == self.cfg.discord["other_category"]:
+            return True
+        return len(name) == 1 and name.isalpha()
+
+    def _pick_adoptable(self, candidates: List[discord.TextChannel],
+                        want: Desired) -> Optional[discord.TextChannel]:
+        """Choose which of several same-named channels to take over.
+
+        Discord allows duplicate channel names, and this guild keeps archived
+        copies of many packs alongside the live channel. Adopting the archive
+        copy would move it into the letter category - producing a real duplicate -
+        and leave the live channel untracked, so prefer, in order: the channel
+        already in the wanted category, then any channel in a managed letter
+        category, then whatever is left. Protected channels are never adopted.
+        """
+        usable = [c for c in candidates if not self._protected(c)]
+        if not usable:
+            if candidates:
+                log.debug("All channels named #%s are protected", want.channel_name)
+            return None
+
+        def rank(channel: discord.TextChannel):
+            current = channel.category.name if channel.category else None
+            if current == want.category:
+                return (0, channel.id)
+            if self._is_managed_category(current):
+                return (1, channel.id)
+            return (2, channel.id)
+
+        usable.sort(key=rank)
+        best = usable[0]
+        if len(usable) > 1:
+            rest = ", ".join(
+                f"#{c.name} in {c.category.name if c.category else 'no category'}"
+                for c in usable[1:]
+            )
+            log.warning(
+                "%d channels are named #%s; adopting the one in %s and leaving %s alone. "
+                "Add the other category to protected_categories to be explicit.",
+                len(usable), want.channel_name,
+                best.category.name if best.category else "no category", rest,
+            )
+        return best
 
     def _protected(self, channel: discord.abc.GuildChannel) -> bool:
         if channel.name in self.cfg.discord["protected_channels"]:
@@ -275,10 +353,107 @@ class Mirror:
                 log.error("Could not upload to #%s: %s", channel.name, exc)
         return ids
 
+    # ---------- permissions the bot needs on what it manages ----------
+
+    def _needed_permissions(self) -> Dict[str, bool]:
+        perms = {
+            "view_channel": True,
+            "send_messages": True,
+            "read_message_history": True,
+            "manage_messages": True,
+            "embed_links": True,
+        }
+        if self.gifmaker and self.gifmaker.enabled:
+            perms["attach_files"] = True
+        return perms
+
+    def _missing_permissions(self, channel: discord.TextChannel) -> List[str]:
+        """Permissions needed before a channel may be torn down and rebuilt."""
+        me = channel.guild.me
+        if me is None:
+            return []
+        actual = channel.permissions_for(me)
+        needed = list(self._needed_permissions())
+        if "embed_links" in needed:
+            needed.remove("embed_links")  # nice to have, not required to rebuild
+        return [name for name in needed if not getattr(actual, name, False)]
+
+    async def _grant_self(self, target, label: str) -> bool:
+        """Give the bot an explicit allow on a category or channel.
+
+        Targets the category where possible so permission-synced channels inherit
+        it and stay synced. Requires Manage Permissions (manage_roles).
+        """
+        me = target.guild.me
+        if self.dry_run:
+            log.info("[dry-run] would grant the bot %s on %s",
+                     ", ".join(sorted(self._needed_permissions())), label)
+            return False
+        try:
+            await target.set_permissions(
+                me, reason="sheet mirror: access to channels it manages",
+                **self._needed_permissions(),
+            )
+        except discord.Forbidden:
+            if not self._warned_manage_roles:
+                self._warned_manage_roles = True
+                log.error(
+                    "Cannot set permissions on %s. The bot needs the Manage Permissions "
+                    "(manage_roles) permission, or discord.fix_permissions: false and a "
+                    "manual allow for the bot on each managed category.", label,
+                )
+            return False
+        except discord.HTTPException as exc:
+            log.error("Could not set permissions on %s: %s", label, exc)
+            return False
+        log.info("Granted the bot access on %s", label)
+        return True
+
+    async def _fix_category_permissions(self, guild: discord.Guild) -> int:
+        """One pass over the categories this bot files channels into. Cheaper and
+        safer than per-channel: synced channels inherit and stay synced, and
+        channels created later inherit too."""
+        if not self.cfg.discord["fix_permissions"]:
+            return 0
+        changed = 0
+        for category in guild.categories:
+            if category.name in self.cfg.discord["protected_categories"]:
+                continue
+            if not self._is_managed_category(category.name):
+                continue
+            actual = category.permissions_for(guild.me)
+            lacking = [n for n in self._needed_permissions() if not getattr(actual, n, False)]
+            if not lacking:
+                continue
+            if await self._grant_self(category, f"category {category.name}"):
+                changed += 1
+        if changed:
+            # Permission changes arrive back over the gateway; give the cache a
+            # moment so this same cycle sees them.
+            await asyncio.sleep(2.0)
+            log.info("Adjusted permissions on %d category/categories", changed)
+        return changed
+
     async def _ensure_content(self, channel: discord.TextChannel, want: Desired,
                               entry: dict, force: bool) -> dict:
         """Post the info message and GIFs. If anything about the row changed,
         the channel's messages are deleted and everything is regenerated."""
+        # Check first that this channel can actually be rebuilt. The purge runs
+        # before the repost, so without send access the channel would be emptied
+        # and then left empty - worse than leaving it alone.
+        blocked = self._missing_permissions(channel)
+        if blocked and self.cfg.discord["fix_permissions"] and not self.dry_run:
+            # The category pass covers synced channels; this catches the rest.
+            if await self._grant_self(channel, f"#{channel.name}"):
+                blocked = self._missing_permissions(channel)
+        if blocked:
+            log.error(
+                "Skipping #%s - the bot lacks %s there. Not purging a channel it "
+                "could not repost to.", channel.name, ", ".join(blocked),
+            )
+            self._blocked.append(channel.name)
+            return entry
+
         gif_paths: List[str] = []
         gif_error: Optional[str] = None
         failures = int(entry.get("gif_failures", 0))
@@ -345,7 +520,31 @@ class Mirror:
 
     async def sync(self, reason: str = "scheduled", force: bool = False) -> Counter:
         async with self._lock:
-            return await self._sync(reason, force)
+            started = time.time()
+            self.status.update(
+                state="running", last_reason=reason, last_started=started, last_error=None
+            )
+            try:
+                stats = await self._sync(reason, force)
+            except Exception as exc:
+                finished = time.time()
+                self.status.update(
+                    state="error",
+                    last_error=f"{type(exc).__name__}: {exc}",
+                    last_finished=finished,
+                    last_duration=finished - started,
+                )
+                raise
+            finished = time.time()
+            self.status.update(
+                state="idle",
+                last_finished=finished,
+                last_duration=finished - started,
+                last_stats=dict(stats),
+                blocked=list(self._blocked),
+                sync_count=int(self.status["sync_count"]) + 1,
+            )
+            return stats
 
     async def _sync(self, reason: str, force: bool = False) -> Counter:
         stats: Counter = Counter()
@@ -359,10 +558,19 @@ class Mirror:
             log.warning("Sheet returned no usable rows; skipping this cycle (nothing deleted)")
             return stats
 
+        self.status["rows_seen"] = len(rows)
+        self._blocked = []
+        self._warned_manage_roles = False
         desired = self.build_desired(rows)
         log.info("Sync (%s): %d rows, %d tracked channels", reason, len(desired), len(self.state.channels))
 
-        by_name = {c.name: c for c in guild.text_channels}
+        # Several channels can share a name - this guild keeps an archived copy of
+        # many packs - so index to a list and choose deliberately below.
+        await self._fix_category_permissions(guild)
+
+        by_name: Dict[str, List[discord.TextChannel]] = {}
+        for existing in guild.text_channels:
+            by_name.setdefault(existing.name, []).append(existing)
         budget = int(self.cfg.discord["max_changes_per_cycle"])
         self._gif_budget = int(self.cfg.gif["max_jobs_per_cycle"])
 
@@ -372,12 +580,11 @@ class Mirror:
             if entry.get("channel_id"):
                 channel = guild.get_channel(int(entry["channel_id"]))
             if channel is None and self.cfg.discord["adopt_existing"]:
-                candidate = by_name.get(want.channel_name)
-                if candidate is not None and self._protected(candidate):
-                    log.debug("Not adopting protected channel #%s", candidate.name)
-                elif candidate is not None:
+                candidate = self._pick_adoptable(by_name.get(want.channel_name, []), want)
+                if candidate is not None:
                     channel = candidate
-                    log.info("Adopted existing channel #%s", channel.name)
+                    where = candidate.category.name if candidate.category else "no category"
+                    log.info("Adopted existing channel #%s (in %s)", channel.name, where)
                     stats["adopted"] += 1
 
             if channel is None:
@@ -401,7 +608,7 @@ class Mirror:
                 except discord.HTTPException as exc:
                     log.error("Could not create #%s: %s", want.channel_name, exc)
                     continue
-                by_name[channel.name] = channel
+                by_name.setdefault(channel.name, []).append(channel)
                 budget -= 1
                 stats["created"] += 1
                 log.info("Created #%s", channel.name)
@@ -412,8 +619,11 @@ class Mirror:
                 if channel.name != want.channel_name and not self.dry_run:
                     old = channel.name
                     await channel.edit(name=want.channel_name, reason="sheet mirror: row renamed")
-                    by_name.pop(old, None)
-                    by_name[channel.name] = channel
+                    if old in by_name:
+                        by_name[old] = [c for c in by_name[old] if c.id != channel.id]
+                        if not by_name[old]:
+                            del by_name[old]
+                    by_name.setdefault(channel.name, []).append(channel)
                     stats["renamed"] += 1
                     log.info("Renamed #%s -> #%s", old, channel.name)
                 current_category = channel.category.name if channel.category else None
@@ -459,6 +669,13 @@ class Mirror:
 
         if not self.dry_run:
             self.state.save()
+        if self._blocked:
+            stats["blocked_by_permissions"] = len(self._blocked)
+            log.error(
+                "%d channel(s) skipped for missing permissions: %s%s",
+                len(self._blocked), ", ".join(self._blocked[:8]),
+                " ..." if len(self._blocked) > 8 else "",
+            )
         log.info("Sync done: %s", dict(stats) or "no changes")
         return stats
 

@@ -13,11 +13,13 @@ import asyncio
 import contextlib
 import logging
 import sys
+import time
 
 import discord
 from discord.ext import tasks
 
 from config import Config, ConfigError
+from dashboard import Dashboard, RingLogHandler
 from gifs import GifMaker
 from mirror import Mirror
 from sheets import SheetError, SheetSource
@@ -34,6 +36,12 @@ class MirrorBot(discord.Client):
         self.cfg = cfg
         self.once = once
         self.mirror = Mirror(self, cfg, SheetSource(cfg), GifMaker(cfg))
+        self.log_ring = RingLogHandler(capacity=int(cfg.dashboard["log_lines"]))
+        self.log_ring.setLevel(logging.INFO)
+        logging.getLogger().addHandler(self.log_ring)
+        self.dashboard = (
+            Dashboard(self, cfg, self.log_ring) if cfg.dashboard["enabled"] and not once else None
+        )
         self.tree = discord.app_commands.CommandTree(self)
         self._register_commands()
 
@@ -59,12 +67,24 @@ class MirrorBot(discord.Client):
             mode = "dry-run" if self.mirror.dry_run else "live"
             gif_state = "on" if self.mirror.gifmaker.enabled else "off"
             failing = sum(1 for e in self.mirror.state.channels.values() if e.get("gif_error"))
-            await interaction.response.send_message(
-                f"Tracking {tracked} channels · polling every "
-                f"{self.cfg.runtime['poll_seconds']}s · GIFs {gif_state}"
-                f"{f' ({failing} failing)' if failing else ''} · {mode}",
-                ephemeral=True,
-            )
+            st = self.mirror.status
+            hours = int(self.cfg.runtime["poll_seconds"]) / 3600
+            lines = [
+                f"**State** {'syncing now' if self.mirror.busy else st['state']} · {mode}",
+                f"**Channels tracked** {tracked}",
+                f"**Sheet rows** {st['rows_seen'] if st['rows_seen'] is not None else 'not read yet'}",
+                f"**Automatic sync** every {hours:.0f}h",
+                f"**Renders** {gif_state}" + (f" ({failing} failing)" if failing else ""),
+            ]
+            if st["last_finished"]:
+                mins = (time.time() - float(st["last_finished"])) / 60
+                summary = ", ".join(f"{v} {k}" for k, v in sorted(st["last_stats"].items()) if v) or "no changes"
+                lines.append(f"**Last sync** {mins:.0f}m ago in {float(st['last_duration']):.0f}s — {summary}")
+            if st["last_error"]:
+                lines.append(f"**Last error** {str(st['last_error'])[:300]}")
+            if self.dashboard is not None:
+                lines.append(f"**Dashboard** port {self.cfg.dashboard['port']}")
+            await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
         async def on_tree_error(interaction: discord.Interaction, error: Exception) -> None:
             if isinstance(error, discord.app_commands.CheckFailure):
@@ -91,12 +111,21 @@ class MirrorBot(discord.Client):
         except discord.HTTPException as exc:
             log.warning("Could not register slash commands: %s", exc)
         if self.once:
-            return  # --once drives a single sync itself; no poll loop
-        self.poll.change_interval(seconds=int(self.cfg.runtime["poll_seconds"]))
+            return  # --once drives a single sync itself; no poll loop and no dashboard
+        if self.dashboard is not None:
+            await self.dashboard.start()
+        interval = int(self.cfg.runtime["poll_seconds"])
+        self.poll.change_interval(seconds=interval)
         self.poll.start()
+        log.info("Automatic sync every %ds (%.1f hours)", interval, interval / 3600)
 
     async def on_ready(self):
         log.info("Connected as %s (guild %s)", self.user, self.cfg.guild_id)
+
+    async def close(self) -> None:
+        if self.dashboard is not None:
+            await self.dashboard.stop()
+        await super().close()
 
     @tasks.loop(seconds=300)
     async def poll(self):

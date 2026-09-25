@@ -1,0 +1,169 @@
+# Copy to config.yaml and edit. The Discord token lives in .env, not here.
+# Generated from a working config; values below are the ones this server uses.
+
+discord:
+  guild_id: 000000000000000000   # right-click the server -> Copy Server ID
+
+  # Channels get grouped under A / B / C ... categories, like your server.
+  # Use "none" to leave every channel uncategorised.
+  category_mode: letter
+  other_category: "#"          # for names starting with a digit or symbol
+
+  adopt_existing: true         # take over channels that already have the right name
+
+  # Rows whose Discord channel does not match slugification of the sheet name.
+  # Packs with "Pit Pack"/"Pit Edit" in the title were shortened by hand when the
+  # channels were made, while plain "Pit"/"Pack" names were kept (blue-pit,
+  # log-pack, marpacker), so those need no entry. Matched case-insensitively on
+  # the row name or its slug.
+  channel_overrides:
+    "Control Pit Pack": control
+    "Novis Pit Edit": novis
+
+  # Give the bot an explicit allow on the categories it manages, so it can post
+  # in channels whose category denies @everyone. Needs the Manage Permissions
+  # (manage_roles) permission. Applied to the category, so permission-synced
+  # channels inherit it and stay synced.
+  fix_permissions: true
+  delete_removed: true         # delete a channel when its row leaves the sheet
+  prune_empty_categories: false
+
+  # Never created, renamed, moved or deleted by the bot:
+  protected_channels: ["rules", "announcements", "packlist", "change-log", "partners",
+                       "general", "pit-trading", "ping-sickener", "cool-addons", "joins"]
+  # Important/Main/Admin are the human areas. The packs-archive categories hold
+  # older copies of many packs under the SAME channel names as the live ones;
+  # listing them here keeps the bot from ever adopting or moving an archived copy.
+  protected_categories: ["Important", "Main", "Admin", "packs-archive", "packs-archive-2"]
+
+  # Safety rails. Discord rate-limits channel create/delete hard, and a
+  # truncated sheet should never wipe the server.
+  max_changes_per_cycle: 25    # leftover work picks up on the next poll
+  max_delete_fraction: 0.25    # abort deletions if more than 25% of rows vanished
+
+  sort_channels: false         # alphabetise within each category (extra API calls)
+  pin_message: false
+  set_topic: false
+  topic_template: "{creator}"
+
+  # "ignore" leaves permissions alone (Status is just text in the message).
+  # "lock" hides Private rows from @everyone.
+  private_mode: ignore
+  private_field: status
+  private_values: ["private"]
+  private_role_ids: []         # roles that still see locked channels
+
+  message_content_intent: false
+
+  # When a row changes, the channel is torn down and rebuilt (info message + GIFs).
+  # "bot_only" deletes only this bot's messages; "all" deletes everything in the
+  # channel, including anything people have posted there.
+  # "all" is correct for this server: the channels were populated by hand before
+  # the bot existed, and bot_only would leave those messages sitting next to the
+  # bot's own copy. Switch to bot_only once there is conversation worth keeping.
+  purge_mode: all
+  purge_limit: 200             # how far back to look when clearing a channel
+
+sheets:
+  spreadsheet_id: "1AbC...your_sheet_id..."   # the long id in the sheet URL
+  worksheet: "Sheet1"
+  header_row: 0                # this sheet has NO header row - row 1 is already data
+
+  # Optional stable ID column. Without it, renaming a row in the sheet means
+  # the old channel is deleted and a new one created. With it, the bot renames
+  # the existing channel instead.
+  key_column: null
+
+  service_account_file: "service_account.json"
+
+  # No header row, so these are column letters, not header text.
+  #   A = name   B = status (Public/Private)   C = creator   D = link
+  #   E is always "none" and is unused.
+  columns:
+    name: A
+    status: B
+    creator: C
+    link: D
+
+message:
+  # Order of the lines in the channel's info message.
+  fields: [name, status, creator, link]
+  labels:
+    name: Name
+    status: Status
+    creator: Creator
+    link: Link
+  # Values treated as blank. With omit_empty, those lines are dropped entirely
+  # (so Private rows with no link just don't show a Link line).
+  omit_values: ["", "none", "n/a", "-"]
+  omit_empty: true
+  empty_placeholder: "none"
+
+gif:
+  enabled: true
+  download_field: link         # which column holds the pack .zip
+
+  # render_cit_inventory.py — the OptiFine CIT inventory renderer.
+  # Placeholders: {python} {project} {url} {download} {outdir} {workdir} {name} {slug}
+  #   {python}  this bot's own interpreter, so the renderer runs in this venv
+  #             (that is where Pillow is installed)
+  #   {project} the directory holding this config file
+  #   {download} makes the bot fetch the .zip first and pass the local path as
+  #             the script's positional argument. GitHub /blob/ links are
+  #             rewritten to raw.githubusercontent.com automatically.
+  # Written this way the same config works on Windows and on the Pi.
+  command:
+    - "{python}"
+    - "{project}/render_cit_inventory.py"
+    - "{download}"
+    - "-o"
+    - "{outdir}"
+    - "--scale"
+    - "3"
+    - "--sort"
+    - "item"
+    - "--dedupe"
+    - "content"
+    - "--layout"     # "key" emits only key_NN.*; "both" would also write
+    - "key"          # page_NN.* and every channel would get duplicate sheets
+    - "--no-text"    # skip the .txt key files — they are not wanted in Discord
+
+  # Only images are collected, grouped by page stem: the first extension listed
+  # here that exists is uploaded, so a page with both a .gif and a .png yields
+  # one upload. Text keys and manifests in the output directory are ignored.
+  media_extensions: [".gif", ".png"]
+  # Optional regex on the filename. Not needed with --layout key, which emits a
+  # single set of images; set "^key_" if you ever switch to --layout both.
+  include_pattern: ""
+
+  cache_dir: "gif-cache"       # results are keyed by download URL
+  work_dir: "work"             # scratch for downloads/renders, relative to this file
+  timeout_seconds: 900         # long animations on a Pi are slow; raise if needed
+  download_timeout: 300
+  max_download_mb: 250
+  max_gifs_per_channel: 10     # pages per channel
+  gifs_per_message: 1          # up to 10 attachments per message
+  max_upload_mb: 9.5           # 49 at boost level 2, 99 at level 3
+  concurrency: 1               # parallel renders — 1 is right for a Pi
+  max_jobs_per_cycle: 3        # new renders per poll; the rest wait
+  max_retries: 3               # stop retrying a broken pack until its link changes
+  post_errors: false           # post a note in-channel when a render fails
+
+dashboard:
+  enabled: true
+  host: "0.0.0.0"              # reachable from the LAN; 127.0.0.1 keeps it local to the Pi
+  port: 2728
+
+  # Anyone who can reach host:port can trigger a sync, which downloads and
+  # renders every pack. Set a secret here to require it; the page asks for it
+  # once and keeps it for the browser session. Leave empty for an open dashboard
+  # on a trusted LAN - the bot logs a warning at startup when it is empty.
+  auth_token: ""
+
+  log_lines: 400               # in-memory console buffer shown on the page
+
+runtime:
+  poll_seconds: 86400          # once a day; use the dashboard or /sync on demand
+  state_file: "state.json"
+  dry_run: false
+  log_level: INFO
