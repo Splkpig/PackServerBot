@@ -1,0 +1,25 @@
+[Unit]
+Description=Discord channel mirror for Google Sheet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/discord-sheet-mirror
+EnvironmentFile=/home/pi/discord-sheet-mirror/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/pi/discord-sheet-mirror/.venv/bin/python bot.py --config config.yaml
+Restart=always
+RestartSec=15
+
+# Modest hardening; the service only needs its own directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ReadWritePaths=/home/pi/discord-sheet-mirror
+
+[Install]
+WantedBy=multi-user.target

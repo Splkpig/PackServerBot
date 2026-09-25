@@ -1,0 +1,17 @@
+# Secrets — never commit these
+.env
+service_account.json
+
+# Local configuration (copy from config.example.yaml)
+config.yaml
+
+# Runtime state and caches
+state.json
+.state-*.json
+gif-cache/
+work/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
