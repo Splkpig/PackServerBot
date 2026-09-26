@@ -26,6 +26,26 @@ from sheets import SheetError, SheetSource
 
 log = logging.getLogger("sheetmirror")
 
+# Server-wide permissions the bot's role needs. A bot cannot raise its own role's
+# permissions, so these go into the invite link; on startup the bot checks them
+# and logs a link that adds whatever is missing. Discord only lets the bot allow or
+# deny a permission on a category if it holds that permission itself, which is why
+# the thread and reaction permissions it denies to @everyone are listed too.
+REQUIRED_PERMISSIONS = discord.Permissions(
+    manage_channels=True,        # create/rename/move/delete channels and categories
+    manage_roles=True,           # "Manage Permissions": set category/channel overwrites
+    view_channel=True,
+    send_messages=True,
+    read_message_history=True,
+    manage_messages=True,        # bulk delete for the rebuild path
+    embed_links=True,
+    attach_files=True,
+    add_reactions=True,
+    create_public_threads=True,
+    create_private_threads=True,
+    send_messages_in_threads=True,
+)
+
 
 class MirrorBot(discord.Client):
     def __init__(self, cfg: Config, once: bool = False):
@@ -86,6 +106,30 @@ class MirrorBot(discord.Client):
                 lines.append(f"**Dashboard** port {self.cfg.dashboard['port']}")
             await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
+        @self.tree.command(
+            name="setup-server",
+            description="Create the # and A-Z categories with the pack channel permissions",
+            guild=guild,
+        )
+        @discord.app_commands.checks.has_permissions(manage_channels=True)
+        async def setup_server(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            missing = self.missing_permissions(interaction.guild)
+            if missing:
+                await interaction.followup.send(
+                    f"The bot's role is missing {', '.join(missing)}. "
+                    f"Re-invite it with this link, then run this again:\n{self.invite_url()}",
+                    ephemeral=True,
+                )
+                return
+            stats = await self.mirror.setup_categories(interaction.guild)
+            summary = ", ".join(f"{k}: {v}" for k, v in sorted(stats.items()))
+            mode = " (dry-run, nothing changed)" if self.mirror.dry_run else ""
+            text = f"Setup complete{mode} — {summary}"
+            if stats["failed"]:
+                text += "\nSome categories failed; see the bot log for details."
+            await interaction.followup.send(text, ephemeral=True)
+
         async def on_tree_error(interaction: discord.Interaction, error: Exception) -> None:
             if isinstance(error, discord.app_commands.CheckFailure):
                 text = "You need the Manage Channels permission to use this."
@@ -119,8 +163,32 @@ class MirrorBot(discord.Client):
         self.poll.start()
         log.info("Automatic sync every %ds (%.1f hours)", interval, interval / 3600)
 
+    def invite_url(self) -> str:
+        return discord.utils.oauth_url(
+            self.application_id,
+            permissions=REQUIRED_PERMISSIONS,
+            guild=discord.Object(id=self.cfg.guild_id),
+            scopes=("bot", "applications.commands"),
+        )
+
+    def missing_permissions(self, guild: discord.Guild | None) -> list[str]:
+        """REQUIRED_PERMISSIONS the bot's roles do not grant in this guild."""
+        if guild is None or guild.me is None:
+            return []
+        have = guild.me.guild_permissions
+        if have.administrator:
+            return []
+        return [name for name, wanted in REQUIRED_PERMISSIONS if wanted and not getattr(have, name)]
+
     async def on_ready(self):
         log.info("Connected as %s (guild %s)", self.user, self.cfg.guild_id)
+        missing = self.missing_permissions(self.get_guild(self.cfg.guild_id))
+        if missing:
+            log.error(
+                "The bot's role is missing server permissions: %s. Enable them under "
+                "Server Settings -> Roles, or re-invite with this link: %s",
+                ", ".join(missing), self.invite_url(),
+            )
 
     async def close(self) -> None:
         if self.dashboard is not None:

@@ -151,7 +151,7 @@ That requires the **Manage Permissions** (`manage_roles`) permission. Server Set
 Without it the bot logs one clear error and changes nothing.
 
 Set `fix_permissions: false` if you would rather add the allow yourself: for each of
-the 23 letter/`#` categories, add the bot's role and allow View Channel, Send
+the letter/`#` categories (or run `/setup-server`), add the bot's role and allow View Channel, Send
 Messages, Read Message History, Manage Messages and Attach Files.
 
 **The bot never purges a channel it cannot post into.** The rebuild deletes before it
@@ -189,11 +189,15 @@ first cleanup pass.
    off and `message_content_intent: false`. If you turn the config flag on without
    enabling it in the portal, startup fails with a clear error.
 3. Invite it with **Manage Channels**, **Manage Permissions**, **View Channels**,
-   **Send Messages**, **Read Message History**, **Attach Files**, **Embed Links** and
-   **Manage Messages** (bulk delete is required for the rebuild path):
+   **Send Messages**, **Read Message History**, **Attach Files**, **Embed Links**,
+   **Manage Messages** (bulk delete is required for the rebuild path), and **Add
+   Reactions**, **Create Public/Private Threads** and **Send Messages in Threads**
+   (Discord only lets the bot deny these to `@everyone` if it holds them itself).
+   The list lives in `REQUIRED_PERMISSIONS` in `bot.py`; on startup the bot logs any
+   that its role lacks, with a ready-made invite link.
 
    ```
-   https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&permissions=268561424&scope=bot%20applications.commands
+   https://discord.com/api/oauth2/authorize?client_id=YOUR_APP_ID&permissions=378225683536&scope=bot%20applications.commands
    ```
 4. Right-click your server → Copy Server ID (Developer Mode on) → `discord.guild_id`.
 
@@ -307,6 +311,12 @@ journalctl -u sheet-mirror -f
   and GIFs. Expensive; use after changing the GIF script.
 - `/mirror-status` — state, channels tracked, sheet rows, sync interval, render
   health, when the last sync ran and what it changed, and the dashboard port.
+- `/setup-server` — create the `#` and `A`–`Z` categories (27 in all) and set their
+  permissions: `@everyone` cannot send messages, create threads or add reactions;
+  the bot can view, send, attach files, read history and manage messages. Categories
+  that already exist keep their other overwrites (e.g. `Admin`) and are fixed in
+  place; channels synced to them are re-synced. Safe to run again. Honors
+  `--dry-run` and `protected_categories`. Requires Manage Channels.
 
 `/sync` and the dashboard's **Sync now** button are the same operation; use whichever
 is closer to hand.

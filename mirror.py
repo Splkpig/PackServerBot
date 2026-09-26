@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import string
 import tempfile
 import time
 import unicodedata
@@ -289,7 +290,10 @@ class Mirror:
                 if mode == "all" or m.author.id == self.bot.user.id
             ]
         except discord.Forbidden:
-            log.warning("No read access to #%s; cannot rebuild", channel.name)
+            if self.dry_run:
+                log.debug("[dry-run] no read access to #%s yet; cannot count messages", channel.name)
+            else:
+                log.warning("No read access to #%s; cannot rebuild", channel.name)
             return 0
         if not candidates:
             return 0
@@ -434,6 +438,81 @@ class Mirror:
             log.info("Adjusted permissions on %d category/categories", changed)
         return changed
 
+    # ---------- /setup-server ----------
+
+    def setup_category_names(self) -> List[str]:
+        """The categories channels get filed into: '#' first, then A-Z."""
+        return [self.cfg.discord["other_category"], *string.ascii_uppercase]
+
+    def _setup_overwrites(self, category: Optional[discord.CategoryChannel],
+                          guild: discord.Guild) -> dict:
+        """Existing overwrites with @everyone locked down and the bot allowed in.
+        Other roles' overwrites (e.g. Admin) are left as they are."""
+        overwrites = dict(category.overwrites) if category else {}
+
+        everyone = overwrites.get(guild.default_role) or discord.PermissionOverwrite()
+        everyone = discord.PermissionOverwrite(**dict(everyone))  # copy, don't mutate the cache
+        everyone.update(
+            send_messages=False,
+            send_messages_in_threads=False,
+            create_public_threads=False,
+            create_private_threads=False,
+            add_reactions=False,
+        )
+        overwrites[guild.default_role] = everyone
+
+        me = overwrites.get(guild.me) or discord.PermissionOverwrite()
+        me = discord.PermissionOverwrite(**dict(me))
+        me.update(**{**self._needed_permissions(), "attach_files": True})
+        overwrites[guild.me] = me
+        return overwrites
+
+    async def setup_categories(self, guild: discord.Guild) -> Counter:
+        """Create or fix the '#' and A-Z categories: @everyone cannot post, thread
+        or react; the bot can post and attach files. Safe to run repeatedly."""
+        stats: Counter = Counter()
+        async with self._lock:  # don't race a sync that may be creating categories
+            for name in self.setup_category_names():
+                if name in self.cfg.discord["protected_categories"]:
+                    log.info("Setup: category %s is protected; leaving it alone", name)
+                    stats["protected"] += 1
+                    continue
+                category = discord.utils.get(guild.categories, name=name)
+                overwrites = self._setup_overwrites(category, guild)
+                try:
+                    if category is None:
+                        if self.dry_run:
+                            log.info("[dry-run] would create category %s", name)
+                        else:
+                            await guild.create_category(
+                                name=name, overwrites=overwrites, reason="/setup-server",
+                            )
+                            log.info("Setup: created category %s", name)
+                        stats["created"] += 1
+                    elif overwrites != category.overwrites:
+                        # Editing a category through the API does not carry the change
+                        # to its channels, so re-sync the ones that were synced before.
+                        synced = [c for c in category.channels if c.permissions_synced]
+                        if self.dry_run:
+                            log.info("[dry-run] would update permissions on category %s "
+                                     "and re-sync %d channel(s)", name, len(synced))
+                        else:
+                            await category.edit(overwrites=overwrites, reason="/setup-server")
+                            for channel in synced:
+                                await channel.edit(sync_permissions=True, reason="/setup-server")
+                            log.info("Setup: updated permissions on category %s "
+                                     "(%d channel(s) re-synced)", name, len(synced))
+                        stats["updated"] += 1
+                    else:
+                        stats["unchanged"] += 1
+                except discord.Forbidden as exc:
+                    log.error("Setup: not allowed to set up category %s: %s", name, exc)
+                    stats["failed"] += 1
+                except discord.HTTPException as exc:
+                    log.error("Setup: could not set up category %s: %s", name, exc)
+                    stats["failed"] += 1
+        return stats
+
     async def _ensure_content(self, channel: discord.TextChannel, want: Desired,
                               entry: dict, force: bool) -> dict:
         """Post the info message and GIFs. If anything about the row changed,
@@ -442,9 +521,16 @@ class Mirror:
         # before the repost, so without send access the channel would be emptied
         # and then left empty - worse than leaving it alone.
         blocked = self._missing_permissions(channel)
-        if blocked and self.cfg.discord["fix_permissions"] and not self.dry_run:
+        if blocked and self.cfg.discord["fix_permissions"]:
+            if self.dry_run:
+                # A live run would grant itself access first, so carry on and
+                # show what the rebuild would do instead of reporting a skip.
+                if channel.guild.me.guild_permissions.manage_roles:
+                    log.debug("[dry-run] would grant the bot %s on #%s",
+                              ", ".join(blocked), channel.name)
+                    blocked = []
             # The category pass covers synced channels; this catches the rest.
-            if await self._grant_self(channel, f"#{channel.name}"):
+            elif await self._grant_self(channel, f"#{channel.name}"):
                 blocked = self._missing_permissions(channel)
         if blocked:
             log.error(
